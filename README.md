@@ -122,4 +122,4 @@ Discord thread ←→ Bot (discord.js) ←→ tmux session
 
 ## License
 
-[WTFPL](LICENSE) — Do What The Fuck You Want To Public License
+[MIT](LICENSE)
