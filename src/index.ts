@@ -1,4 +1,4 @@
-import { Client, Events, GatewayIntentBits } from "discord.js";
+import { Client, Events, GatewayIntentBits, Partials } from "discord.js";
 import { join } from "node:path";
 import { SessionStore } from "./store/json-store.js";
 import { AuditLogger } from "./utils/logger.js";
@@ -15,6 +15,7 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
   ],
+  partials: [Partials.Channel, Partials.Message],
 });
 
 const handlers = createHandlers(store, logger);
@@ -43,31 +44,41 @@ client.once(Events.ClientReady, async (c) => {
 
 // --- Interaction handler ---
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (interaction.isChatInputCommand()) {
-    switch (interaction.commandName) {
-      case "new":
-        await handlers.handleNew(interaction);
-        break;
-      case "status":
-        await handlers.handleStatus(interaction);
-        break;
-      case "ctrlc":
-        await handlers.handleCtrlC(interaction);
-        break;
-      case "close":
-        await handlers.handleClose(interaction);
-        break;
-      case "claude":
-        await handlers.handleClaude(interaction);
-        break;
+  try {
+    if (interaction.isChatInputCommand()) {
+      switch (interaction.commandName) {
+        case "new":
+          await handlers.handleNew(interaction);
+          break;
+        case "status":
+          await handlers.handleStatus(interaction);
+          break;
+        case "ctrlc":
+          await handlers.handleCtrlC(interaction);
+          break;
+        case "ctrlcc":
+          await handlers.handleCtrlCC(interaction);
+          break;
+        case "close":
+          await handlers.handleClose(interaction);
+          break;
+        case "claude":
+          await handlers.handleClaude(interaction);
+          break;
+      }
+    } else if (interaction.isButton()) {
+      await handlers.handleButton(interaction);
     }
-  } else if (interaction.isButton()) {
-    await handlers.handleButton(interaction);
+  } catch (err) {
+    console.error("[interaction] Error:", err);
   }
 });
 
 // --- Message handler ---
 client.on(Events.MessageCreate, async (message) => {
+  if (!message.author.bot) {
+    console.log(`[msg] from=${message.author.id} channel=${message.channelId} content="${message.content.slice(0, 50)}"`);
+  }
   await handlers.handleMessage(message);
 });
 

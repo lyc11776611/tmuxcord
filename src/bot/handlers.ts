@@ -13,30 +13,41 @@ import { SessionStore, SessionBinding } from "../store/json-store.js";
 import { TmuxSession } from "../tmux/session.js";
 import { OutputPoller } from "../tmux/output.js";
 import { detectMode } from "../detection/mode.js";
+import { stripAnsi } from "../utils/strip-ansi.js";
 import { AuditLogger } from "../utils/logger.js";
-
-interface ActivePoller {
-  timer: ReturnType<typeof setInterval>;
-  poller: OutputPoller;
-}
 
 function formatOutput(raw: string): string {
   let text = raw.trim();
   if (text.length > 1800) {
     text = "...(truncated)\n" + text.slice(-1780);
   }
-  return "```\n" + text + "\n```";
+  return "```ansi\n" + text + "\n```";
 }
 
 export function createHandlers(store: SessionStore, logger: AuditLogger) {
-  const activePollers = new Map<string, ActivePoller>();
+  const activeTimers = new Map<string, ReturnType<typeof setInterval>>();
+  const pollers = new Map<string, OutputPoller>();
 
   function stopPoller(threadId: string): void {
-    const entry = activePollers.get(threadId);
-    if (entry) {
-      clearInterval(entry.timer);
-      activePollers.delete(threadId);
+    const timer = activeTimers.get(threadId);
+    if (timer) {
+      clearInterval(timer);
+      activeTimers.delete(threadId);
     }
+  }
+
+  function getOrCreatePoller(threadId: string): OutputPoller {
+    let poller = pollers.get(threadId);
+    if (!poller) {
+      poller = new OutputPoller();
+      pollers.set(threadId, poller);
+    }
+    return poller;
+  }
+
+  function removePoller(threadId: string): void {
+    stopPoller(threadId);
+    pollers.delete(threadId);
   }
 
   function startPoller(
@@ -44,10 +55,11 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
     tmuxName: string,
     channel: TextChannel | ThreadChannel
   ): void {
-    // Avoid duplicate pollers
+    // Stop existing timer but KEEP the poller's diff state
     stopPoller(threadId);
 
-    const poller = new OutputPoller();
+    const poller = getOrCreatePoller(threadId);
+    poller.resetStability();
     const startTime = Date.now();
     const POLL_INTERVAL = 300;
     const MAX_DURATION = 30_000;
@@ -58,25 +70,36 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
       try {
         // Stop after 30s
         if (Date.now() - startTime > MAX_DURATION) {
+          console.log(`[poller:${threadId}] Timeout, stopping`);
           stopPoller(threadId);
           return;
         }
 
         // Stop if stable
         if (poller.isStable()) {
+          console.log(`[poller:${threadId}] Stable, stopping`);
           stopPoller(threadId);
           return;
         }
 
+        // Plain capture for diff and detection
         const raw = await TmuxSession.capturePane(tmuxName);
         const newContent = poller.diff(raw);
 
         if (!newContent) return;
 
+        console.log(`[poller:${threadId}] New content (${newContent.length} chars)`);
+
         // Update activity
         store.touch(threadId);
 
         const detection = detectMode(raw);
+
+        // Get colored version — extract matching new lines from end
+        const ansiRaw = await TmuxSession.capturePaneAnsi(tmuxName);
+        const newLineCount = newContent.trimEnd().split("\n").length;
+        const ansiLines = ansiRaw.trimEnd().split("\n");
+        const displayContent = ansiLines.slice(-newLineCount).join("\n");
 
         if (
           (detection.mode === "permission" || detection.mode === "choice") &&
@@ -103,17 +126,16 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
           }
 
           await channel.send({
-            content: formatOutput(newContent),
+            content: formatOutput(displayContent),
             components: [row],
           });
 
-          // Restart poller to catch output after button press
-          startPoller(threadId, tmuxName, channel);
+          // Stop and wait for button press — button handler restarts poller
           return;
         }
 
-        // Regular output
-        const formatted = formatOutput(newContent);
+        // Regular output — only new content, with ANSI colors
+        const formatted = formatOutput(displayContent);
 
         if (lastMessageId) {
           try {
@@ -128,13 +150,13 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
           const sent = await channel.send(formatted);
           lastMessageId = sent.id;
         }
-      } catch {
-        // Silently handle errors (session may have been killed)
+      } catch (err) {
+        console.error(`[poller:${threadId}] Error:`, err);
         stopPoller(threadId);
       }
     }, POLL_INTERVAL);
 
-    activePollers.set(threadId, { timer, poller });
+    activeTimers.set(threadId, timer);
   }
 
   async function handleNew(
@@ -266,6 +288,44 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
     await interaction.reply("Sent Ctrl+C.");
   }
 
+  async function handleCtrlCC(
+    interaction: ChatInputCommandInteraction
+  ): Promise<void> {
+    const userId = interaction.user.id;
+    const threadId = interaction.channelId;
+
+    if (!isAllowed(userId)) {
+      await interaction.reply({ content: "Not authorized.", flags: 64 });
+      return;
+    }
+
+    const binding = store.get(threadId);
+    if (!binding) {
+      await interaction.reply({
+        content: "No session bound to this thread.",
+        flags: 64,
+      });
+      return;
+    }
+
+    await TmuxSession.sendCtrlC(binding.tmuxSession);
+    await new Promise(r => setTimeout(r, 200));
+    await TmuxSession.sendCtrlC(binding.tmuxSession);
+    store.touch(threadId);
+
+    logger.log({
+      actor: userId,
+      threadId,
+      action: "ctrlcc",
+      result: "ok",
+    });
+
+    await interaction.reply("Sent Ctrl+C x2.");
+
+    const channel = interaction.channel as TextChannel | ThreadChannel;
+    startPoller(threadId, binding.tmuxSession, channel);
+  }
+
   async function handleClose(
     interaction: ChatInputCommandInteraction
   ): Promise<void> {
@@ -286,7 +346,7 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
       return;
     }
 
-    stopPoller(threadId);
+    removePoller(threadId);
 
     try {
       await TmuxSession.kill(binding.tmuxSession);
@@ -432,14 +492,15 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
     }
   }
 
-  function getActivePollers(): Map<string, ActivePoller> {
-    return activePollers;
+  function getActivePollers(): Map<string, ReturnType<typeof setInterval>> {
+    return activeTimers;
   }
 
   return {
     handleNew,
     handleStatus,
     handleCtrlC,
+    handleCtrlCC,
     handleClose,
     handleClaude,
     handleMessage,

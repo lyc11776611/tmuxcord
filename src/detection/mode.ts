@@ -20,8 +20,8 @@ export function detectMode(paneText: string): DetectionResult {
     return { mode: "permission", buttons };
   }
 
-  // Check for numbered choice list
-  const choicePattern = /^\s*(\d+)\.\s+(.+)$/gm;
+  // Check for numbered choice list (handles > prefix from Claude Code selection UI)
+  const choicePattern = /^\s*[❯>]?\s*(\d+)\.\s+(.+)$/gm;
   const choices: { label: string; key: string }[] = [];
   let match;
   while ((match = choicePattern.exec(trimmed)) !== null) {

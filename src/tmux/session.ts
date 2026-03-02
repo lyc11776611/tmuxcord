@@ -15,7 +15,10 @@ export class TmuxSession {
   }
 
   static async sendKeys(name: string, text: string): Promise<void> {
-    await execFileAsync("tmux", ["send-keys", "-t", name, text, "Enter"]);
+    // Send text literally (-l prevents interpreting key names),
+    // then send Enter separately for reliable execution in TUIs like Claude Code
+    await execFileAsync("tmux", ["send-keys", "-t", name, "-l", text]);
+    await execFileAsync("tmux", ["send-keys", "-t", name, "Enter"]);
   }
 
   static async sendCtrlC(name: string): Promise<void> {
@@ -29,6 +32,13 @@ export class TmuxSession {
   static async capturePane(name: string): Promise<string> {
     const { stdout } = await execFileAsync("tmux", [
       "capture-pane", "-t", name, "-p", "-S", "-100",
+    ]);
+    return stdout;
+  }
+
+  static async capturePaneAnsi(name: string): Promise<string> {
+    const { stdout } = await execFileAsync("tmux", [
+      "capture-pane", "-t", name, "-p", "-e", "-S", "-100",
     ]);
     return stdout;
   }

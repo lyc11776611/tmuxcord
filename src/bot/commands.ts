@@ -14,6 +14,10 @@ export const commands = [
     .setDescription("Send Ctrl+C to the bound terminal session"),
 
   new SlashCommandBuilder()
+    .setName("ctrlcc")
+    .setDescription("Send Ctrl+C twice (to exit Claude Code)"),
+
+  new SlashCommandBuilder()
     .setName("close")
     .setDescription("Close the terminal session and remove binding"),
 

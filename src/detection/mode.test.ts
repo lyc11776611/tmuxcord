@@ -42,6 +42,26 @@ Which approach do you prefer?
     expect(result.buttons!.length).toBe(3);
   });
 
+  it("detects Claude Code trust dialog with arrow prefix", () => {
+    const text = `
+ Accessing workspace:
+
+ /home/ubuntu/worktrees
+
+ Quick safety check: Is this a project you created or one you trust?
+
+ ❯ 1. Yes, I trust this folder
+   2. No, exit
+
+ Enter to confirm`;
+    const result = detectMode(text);
+    expect(result.mode).toBe("choice");
+    expect(result.buttons).toBeDefined();
+    expect(result.buttons!.length).toBe(2);
+    expect(result.buttons![0].label).toBe("Yes, I trust this folder");
+    expect(result.buttons![0].key).toBe("1");
+  });
+
   it("detects processing state (no prompt)", () => {
     const text = `
 Reading file src/index.ts...

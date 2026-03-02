@@ -5,3 +5,4 @@ logs/
 .env
 .test-data/
 .test-logs/
+.bot.pid
