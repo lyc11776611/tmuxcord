@@ -30,4 +30,12 @@ export const commands = [
         .setDescription("Directory to run Claude Code in")
         .setRequired(false)
     ),
+
+  new SlashCommandBuilder()
+    .setName("peek")
+    .setDescription("Show current terminal screen and restart polling"),
+
+  new SlashCommandBuilder()
+    .setName("scroll")
+    .setDescription("Show scrollback history not yet sent to Discord"),
 ];

@@ -43,6 +43,13 @@ export class TmuxSession {
     return stdout;
   }
 
+  static async capturePaneFull(name: string): Promise<string> {
+    const { stdout } = await execFileAsync("tmux", [
+      "capture-pane", "-t", name, "-p", "-e", "-S", "-",
+    ]);
+    return stdout;
+  }
+
   static async exists(name: string): Promise<boolean> {
     try {
       await execFileAsync("tmux", ["has-session", "-t", name]);

@@ -6,6 +6,14 @@ import { TmuxSession } from "./tmux/session.js";
 import { createHandlers } from "./bot/handlers.js";
 import "dotenv/config";
 
+process.on("unhandledRejection", (err) => {
+  console.error("[FATAL] Unhandled rejection:", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] Uncaught exception:", err);
+});
+
 const store = new SessionStore(join(__dirname, "..", "data", "sessions.json"));
 const logger = new AuditLogger(join(__dirname, "..", "logs", "audit.jsonl"));
 
@@ -65,12 +73,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
         case "claude":
           await handlers.handleClaude(interaction);
           break;
+        case "peek":
+          await handlers.handlePeek(interaction);
+          break;
+        case "scroll":
+          await handlers.handleScroll(interaction);
+          break;
       }
     } else if (interaction.isButton()) {
       await handlers.handleButton(interaction);
     }
   } catch (err) {
     console.error("[interaction] Error:", err);
+    try {
+      const msg = `**Internal error:** \`${err instanceof Error ? err.message : String(err)}\``;
+      if (interaction.isRepliable()) {
+        if (interaction.deferred || interaction.replied) {
+          await interaction.followUp({ content: msg, flags: 64 });
+        } else {
+          await interaction.reply({ content: msg, flags: 64 });
+        }
+      }
+    } catch {
+      // Last resort — nothing we can do
+    }
   }
 });
 

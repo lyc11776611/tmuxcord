@@ -12,6 +12,26 @@ export class OutputPoller {
       return null;
     }
 
+    // Check if this is a minor TUI redraw (spinner, cursor, timing)
+    // Spinner/cursor changes only 1-2 lines; streaming changes 3+
+    if (this.lastContent) {
+      const oldLines = this.lastContent.split("\n");
+      const newLines = trimmed.split("\n");
+      if (oldLines.length === newLines.length && oldLines.length > 3) {
+        let diffCount = 0;
+        for (let i = 0; i < oldLines.length; i++) {
+          if (oldLines[i] !== newLines[i]) diffCount++;
+        }
+        if (diffCount <= 2) {
+          // Only 1-2 lines changed — spinner/cursor/timing redraw
+          // Update lastContent but do NOT increment sameCount —
+          // the terminal is still active (spinner running), not stable
+          this.lastContent = trimmed;
+          return null;
+        }
+      }
+    }
+
     this.sameCount = 0;
     let newContent: string;
 
@@ -55,5 +75,9 @@ export class OutputPoller {
   reset(): void {
     this.lastContent = "";
     this.sameCount = 0;
+  }
+
+  getLastContent(): string {
+    return this.lastContent;
   }
 }

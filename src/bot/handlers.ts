@@ -3,6 +3,7 @@ import {
   ButtonInteraction,
   Message,
   ActionRowBuilder,
+  AttachmentBuilder,
   ButtonBuilder,
   ButtonStyle,
   TextChannel,
@@ -24,9 +25,43 @@ function formatOutput(raw: string): string {
   return "```ansi\n" + text + "\n```";
 }
 
+function buildButtonRows(
+  threadId: string,
+  buttons: { label: string; key: string }[]
+): ActionRowBuilder<ButtonBuilder>[] {
+  const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+  for (let i = 0; i < buttons.length; i += 5) {
+    const row = new ActionRowBuilder<ButtonBuilder>();
+    for (const btn of buttons.slice(i, i + 5)) {
+      const style =
+        btn.label === "Allow"
+          ? ButtonStyle.Success
+          : btn.label === "Deny"
+            ? ButtonStyle.Danger
+            : ButtonStyle.Secondary;
+      const label = btn.label.length > 77 ? btn.label.slice(0, 77) + "..." : btn.label;
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`tmux-btn:${threadId}:${btn.key}`)
+          .setLabel(label)
+          .setStyle(style)
+      );
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+interface ScrollState {
+  chunks: string[];    // chunks[0]=current screen, [1]=just above, [2]=further back...
+  msgIds: string[];    // tracked Discord message IDs, ordered top to bottom
+  depth: number;       // how many chunks revealed so far
+}
+
 export function createHandlers(store: SessionStore, logger: AuditLogger) {
   const activeTimers = new Map<string, ReturnType<typeof setInterval>>();
   const pollers = new Map<string, OutputPoller>();
+  const scrollStates = new Map<string, ScrollState>();
 
   function stopPoller(threadId: string): void {
     const timer = activeTimers.get(threadId);
@@ -57,6 +92,8 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
   ): void {
     // Stop existing timer but KEEP the poller's diff state
     stopPoller(threadId);
+    // Invalidate scroll state since terminal content is changing
+    scrollStates.delete(threadId);
 
     const poller = getOrCreatePoller(threadId);
     poller.resetStability();
@@ -108,26 +145,9 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
           // Stop poller while waiting for button input
           stopPoller(threadId);
 
-          const row = new ActionRowBuilder<ButtonBuilder>();
-          for (const btn of detection.buttons) {
-            const style =
-              btn.label === "Allow"
-                ? ButtonStyle.Success
-                : btn.label === "Deny"
-                  ? ButtonStyle.Danger
-                  : ButtonStyle.Secondary;
-
-            row.addComponents(
-              new ButtonBuilder()
-                .setCustomId(`tmux-btn:${threadId}:${btn.key}`)
-                .setLabel(btn.label)
-                .setStyle(style)
-            );
-          }
-
           await channel.send({
             content: formatOutput(displayContent),
-            components: [row],
+            components: buildButtonRows(threadId, detection.buttons),
           });
 
           // Stop and wait for button press — button handler restarts poller
@@ -153,6 +173,9 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
       } catch (err) {
         console.error(`[poller:${threadId}] Error:`, err);
         stopPoller(threadId);
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const short = errMsg.length > 200 ? errMsg.slice(0, 200) + "..." : errMsg;
+        channel.send(`**Poller error:** \`${short}\``).catch(() => {});
       }
     }, POLL_INTERVAL);
 
@@ -406,12 +429,179 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
       detail: dir ?? undefined,
     });
 
+    // Reset poller fully so CC's initial screen shows as new content
+    const poller = getOrCreatePoller(threadId);
+    poller.reset();
+
     await interaction.reply(
       `Starting Claude Code${dir ? ` in \`${dir}\`` : ""}...`
     );
 
+    // Delay before polling — give CC time to render its TUI
     const channel = interaction.channel as TextChannel | ThreadChannel;
-    startPoller(threadId, binding.tmuxSession, channel);
+    setTimeout(() => {
+      startPoller(threadId, binding.tmuxSession, channel);
+    }, 2000);
+  }
+
+  async function handlePeek(
+    interaction: ChatInputCommandInteraction
+  ): Promise<void> {
+    const userId = interaction.user.id;
+    const threadId = interaction.channelId;
+
+    if (!isAllowed(userId)) {
+      await interaction.reply({ content: "Not authorized.", flags: 64 });
+      return;
+    }
+
+    const binding = store.get(threadId);
+    if (!binding) {
+      await interaction.reply({
+        content: "No session bound to this thread.",
+        flags: 64,
+      });
+      return;
+    }
+
+    // Defer immediately to avoid 3s timeout
+    await interaction.deferReply();
+
+    const alive = await TmuxSession.exists(binding.tmuxSession);
+    if (!alive) {
+      await interaction.editReply(
+        "Session is dead. Use `/close` then `/new` to start fresh."
+      );
+      return;
+    }
+
+    try {
+      // Capture full screen with ANSI colors
+      const ansiRaw = await TmuxSession.capturePaneAnsi(binding.tmuxSession);
+      const raw = await TmuxSession.capturePane(binding.tmuxSession);
+
+      // Update poller baseline so next poll doesn't repeat this content
+      const poller = getOrCreatePoller(threadId);
+      poller.diff(raw); // advance baseline
+
+      const detection = detectMode(raw);
+      store.touch(threadId);
+
+      if (
+        (detection.mode === "permission" || detection.mode === "choice") &&
+        detection.buttons
+      ) {
+        await interaction.editReply({
+          content: formatOutput(ansiRaw.trimEnd()),
+          components: buildButtonRows(threadId, detection.buttons),
+        });
+        return;
+      }
+
+      await interaction.editReply(formatOutput(ansiRaw.trimEnd()));
+
+      // Restart poller to catch new changes
+      const channel = interaction.channel as TextChannel | ThreadChannel;
+      startPoller(threadId, binding.tmuxSession, channel);
+    } catch (err) {
+      console.error(`[peek:${threadId}] Error:`, err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const short = errMsg.length > 200 ? errMsg.slice(0, 200) + "..." : errMsg;
+      await interaction.editReply(`**Peek error:** \`${short}\``).catch(() => {});
+    }
+  }
+
+  async function handleScroll(
+    interaction: ChatInputCommandInteraction
+  ): Promise<void> {
+    const userId = interaction.user.id;
+    const threadId = interaction.channelId;
+
+    if (!isAllowed(userId)) {
+      await interaction.reply({ content: "Not authorized.", flags: 64 });
+      return;
+    }
+
+    const binding = store.get(threadId);
+    if (!binding) {
+      await interaction.reply({
+        content: "No session bound to this thread.",
+        flags: 64,
+      });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+      let state = scrollStates.get(threadId);
+
+      if (!state) {
+        // First scroll: capture full scrollback, split into chunks
+        const fullAnsi = await TmuxSession.capturePaneFull(binding.tmuxSession);
+        const lines = fullAnsi.trimEnd().split("\n");
+
+        // Build chunks from bottom up, ~1700 chars each (room for ```ansi wrapper)
+        const chunks: string[] = [];
+        let currentChunk: string[] = [];
+        let currentLen = 0;
+
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i];
+          if (currentLen + line.length + 1 > 1700 && currentChunk.length > 0) {
+            chunks.push(currentChunk.reverse().join("\n"));
+            currentChunk = [];
+            currentLen = 0;
+          }
+          currentChunk.push(line);
+          currentLen += line.length + 1;
+        }
+        if (currentChunk.length > 0) {
+          chunks.push(currentChunk.reverse().join("\n"));
+        }
+        // chunks[0] = bottom (current screen), [1] = just above, [N] = top (oldest)
+
+        if (chunks.length <= 1) {
+          await interaction.editReply("No scrollback beyond current screen.");
+          return;
+        }
+
+        state = { chunks, msgIds: [], depth: 0 };
+        scrollStates.set(threadId, state);
+      }
+
+      state.depth++;
+
+      if (state.depth >= state.chunks.length) {
+        await interaction.editReply("No more scrollback.");
+        return;
+      }
+
+      const d = state.depth;
+      const channel = interaction.channel as TextChannel | ThreadChannel;
+
+      // Edit existing scroll messages: msg[i] shifts to show chunks[d - i]
+      for (let i = 0; i < state.msgIds.length; i++) {
+        const chunkIdx = d - i;
+        try {
+          const msg = await channel.messages.fetch(state.msgIds[i]);
+          await msg.edit(formatOutput(state.chunks[chunkIdx]));
+        } catch {
+          // Message may have been deleted
+        }
+      }
+
+      // This deferred reply becomes the new bottom scroll message: chunks[1]
+      const reply = await interaction.editReply(formatOutput(state.chunks[1]));
+      state.msgIds.push(reply.id);
+
+      store.touch(threadId);
+    } catch (err) {
+      console.error(`[scroll:${threadId}] Error:`, err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const short = errMsg.length > 200 ? errMsg.slice(0, 200) + "..." : errMsg;
+      await interaction.editReply(`**Scroll error:** \`${short}\``).catch(() => {});
+    }
   }
 
   async function handleMessage(message: Message): Promise<void> {
@@ -503,6 +693,8 @@ export function createHandlers(store: SessionStore, logger: AuditLogger) {
     handleCtrlCC,
     handleClose,
     handleClaude,
+    handlePeek,
+    handleScroll,
     handleMessage,
     handleButton,
     stopPoller,
